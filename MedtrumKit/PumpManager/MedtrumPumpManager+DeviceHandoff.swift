@@ -265,7 +265,7 @@ extension MedtrumPumpManager: PumpDeliveryOdometer {
 
     /// From the patch's own status, so it includes a bolus another controller started
     public var bolusUnderWayEndsAt: Date? {
-        guard let endsAt = state.reportedBolusEndsAt ?? state.bolusDose?.estimatedEndDate, endsAt > .now else {
+        guard let endsAt = state.reportedBolusEndsAt, endsAt > .now else {
             return nil
         }
 

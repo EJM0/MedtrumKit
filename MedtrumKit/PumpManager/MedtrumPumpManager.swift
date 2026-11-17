@@ -216,10 +216,26 @@ public class MedtrumPumpManager: DeviceManager {
 
     private var mustProvideBLEHeartbeat = false
 
-    /// The link stays up between commands: the host wants the patch's notifications as its heartbeat. Never on a patch
-    /// handed over by another controller, so that one can take it back.
+    /// False for a patch this controller was handed by another: the link is never held between commands, foreground or
+    /// keep-alive, so the controller that handed it over can take it back
+    var holdsConnectionBetweenCommands: Bool {
+        !state.configuredByAnotherController
+    }
+
+    /// OmnipodKit's background Pod Keep Alive: the link stays up in the background too. For the host's heartbeat
+    /// (Medtrum has no way to wake the app without the link) and for silent tones, which keep the app alive for it.
+    var keepsConnectedInBackground: Bool {
+        mustProvideBLEHeartbeat || state.useSilentTones
+    }
+
+    /// The link is held rather than idle-disconnected: while the app is in the foreground, so in-app commands are
+    /// instant, or in the background with a keep-alive. Otherwise connect on demand.
     var shouldHoldConnection: Bool {
-        mustProvideBLEHeartbeat && !state.configuredByAnotherController
+        guard holdsConnectionBetweenCommands else {
+            return false
+        }
+
+        return bluetooth?.isAppForeground == true || keepsConnectedInBackground
     }
 
     /// Something needs the link beyond a single command: the heartbeat, a bolus whose progress only arrives as
@@ -403,9 +419,11 @@ public extension MedtrumPumpManager {
         return nil
     }
 
+    /// The patch gives a bolus at 1.5 U per minute
+    static let bolusUnitsPerSecond = 1.5 / 60
+
     func estimatedDuration(toBolus units: Double) -> TimeInterval {
-        // 1.5 unit per minute
-        units / 1.5 * TimeInterval(minutes: 1)
+        units / Self.bolusUnitsPerSecond
     }
 
     func enactBolus(
@@ -459,6 +477,8 @@ public extension MedtrumPumpManager {
             self.emitPumpEvents(events, replacePendingEvents: false)
 
             self.state.bolusDose = doseEntry
+            // As the patch accepted it, until its first status (OmnipodKit reads it off the bolus command's status)
+            self.state.reportedBolusEndsAt = Date.now.addingTimeInterval(duration)
             self.state.untrackedDeliveryIsForeign = false
             self.notifyStateDidChange()
 

@@ -24,9 +24,17 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
 
     // MARK: Connect on demand (managerQueue-isolated)
 
-    /// How long a link with nothing to do stays up, as OmnipodKit's connect-on-demand.
-    /// ponytail: one constant for every host; make it per host if the loop's two connects per cycle cost too much.
-    static let idleDisconnectSeconds: TimeInterval = 4
+    /// Idle-disconnect delay after the last command, as OmnipodKit's. Kept short so that in the background the link
+    /// drops before iOS suspends the app; the foreground and a keep-alive hold the link separately
+    /// (`MedtrumPumpManager.shouldHoldConnection`), so this only takes effect while backgrounded. A status read and the
+    /// dose after it share one connection only when the dose comes within this delay: each command restarts it.
+    static var idleDisconnectSeconds: TimeInterval {
+        (UserDefaults.standard.object(forKey: "MedtrumKit.idleDisconnectSeconds") as? Double) ?? 4
+    }
+
+    /// True while the app is frontmost: the link is held so in-app commands are instant. Written on managerQueue, read
+    /// across queues by the pump manager (benign bool race, as OmnipodKit's).
+    private(set) var isAppForeground = false
 
     private var idleDisconnect: DispatchWorkItem?
 
@@ -99,6 +107,83 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
                 let options: [String: Any] = [:]
             #endif
             self.manager = CBCentralManager(delegate: self, queue: managerQueue, options: options)
+        }
+
+        let center = NotificationCenter.default
+        center.addObserver(forName: HostAppState.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.managerQueue.async {
+                self?.enterForeground()
+            }
+        }
+        center.addObserver(forName: HostAppState.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.managerQueue.async {
+                self?.enterBackground()
+            }
+        }
+
+        // Seed from the live application state: a manager built after the app became active never sees the
+        // notification for this launch (loopandlearn/OmnipodKit#133). If the notification wins, this is a no-op.
+        DispatchQueue.main.async { [weak self] in
+            guard HostAppState.isActive else {
+                return
+            }
+            self?.managerQueue.async {
+                guard let self, !self.isAppForeground else {
+                    return
+                }
+                self.enterForeground()
+            }
+        }
+    }
+
+    /// The app came to the front: hold the link, connecting now if it is down, so in-app commands are instant
+    private func enterForeground() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        isAppForeground = true
+        logger.info("[lifecycle] app foreground")
+        connectToHold(why: "foreground - pre-connecting to hold the link")
+    }
+
+    /// The app went to the background: drop the held link, unless a keep-alive holds it (the heartbeat, silent tones)
+    /// or a command or a bolus still needs it
+    private func enterBackground() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        isAppForeground = false
+        logger.info("[lifecycle] app background")
+
+        if pumpManager?.shouldHoldConnection == true {
+            connectToHold(why: "background - keep-alive holding the link")
+            return
+        }
+
+        if attempt != nil || peripheralManager?.isWriting == true {
+            // Mid-command: the idle disconnect drops the link after it
+            logger.info("[connectOnDemand] background - command in flight, deferring disconnect to idle")
+            armIdleDisconnect()
+            return
+        }
+
+        guard pumpManager?.needsLink != true else {
+            return
+        }
+
+        cancelLinkOnQueue(why: "background")
+    }
+
+    /// Connects if the link should be held and is down
+    private func connectToHold(why: String) {
+        guard pumpManager?.shouldHoldConnection == true, pumpManager?.state.pumpState.isRunning == true,
+              !isReleasedForLoan, attempt == nil, !isConnectedOnQueue,
+              peripheral != nil || pumpManager?.state.peripheralIdentifier != nil
+        else {
+            return
+        }
+
+        logger.info("[connectOnDemand] \(why)")
+        ensureConnectedOnQueue { error in
+            if let error {
+                self.logger.warning("Failed to connect to hold the link: \(error)")
+            }
         }
     }
 

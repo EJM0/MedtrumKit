@@ -8,7 +8,7 @@ Medtrum Bluetooth PumpManager For Loop.
 
 ## Connection
 
-MedtrumKit connects to the patch on demand: for a command or a status read, then it hangs up about 4 s after the last one. The link stays up while a bolus runs (its progress only arrives as notifications), while a patch is set up, and while the app needs the pump as its heartbeat (a CGM that can't wake the loop). Alarms such as an occlusion or an expired patch are therefore seen at the next connect, within one loop cycle; the patch beeps by itself in the meantime.
+MedtrumKit connects to the patch the way OmnipodKit does. While the app is in the foreground the link is held, so in-app commands are instant. In the background it connects on demand: for a command or a status read, then it hangs up about 4 s after the last one (`MedtrumKit.idleDisconnectSeconds` in UserDefaults). The link stays up in the background while a bolus runs (its progress only arrives as notifications), while a patch is set up, when the app needs the pump as its heartbeat (a CGM that can't wake the loop), and with silent tones on. A patch handed over by another controller is never held, so that controller can take it back. Alarms such as an occlusion or an expired patch are therefore seen at the next connect, within one loop cycle; the patch beeps by itself in the meantime.
 
 ## Handing the patch to another controller (Watch Loop)
 

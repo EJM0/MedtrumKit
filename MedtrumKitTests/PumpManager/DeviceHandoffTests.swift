@@ -211,10 +211,18 @@ final class DeviceHandoffTests: XCTestCase {
         StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)
         XCTAssertEqual(state.reportedBolusEndsAt, now.addingTimeInterval(StateSyncer.foreignBolusEndsWithin))
 
-        let own = makeBolus()
-        state.bolusDose = own
+        // Our own 1 U bolus, 0.5 U delivered: the other 0.5 U at 1.5 U/min take 20 s
+        state.bolusDose = makeBolus()
         StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)
-        XCTAssertEqual(state.reportedBolusEndsAt, max(own.estimatedEndDate, now))
+        XCTAssertEqual(state.reportedBolusEndsAt!.timeIntervalSince(now), 20, accuracy: 1e-9)
+
+        StateSyncer.trackBolusUnderWay(
+            syncResponse: SynchronizePacketResponse(state: .active, activeAlarms: []),
+            state: state,
+            fullSync: false,
+            receivedAt: now
+        )
+        XCTAssertNotNil(state.reportedBolusEndsAt, "a notification without bolus data says nothing about it")
 
         response.bolus = BolusData(type: 0, completed: true, delivered: 1)
         StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)

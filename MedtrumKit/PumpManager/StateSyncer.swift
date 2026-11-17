@@ -179,12 +179,14 @@ enum StateSyncer {
         pumpManager.notifyStateDidChange()
     }
 
-    /// Rolling, because the patch does not report how much the bolus it is giving was for.
-    /// ponytail: another controller's bolus is assumed to end within 30 s of each status; read its target from
-    /// the patch's history if a host needs the real end.
+    /// The patch reports what a bolus has delivered, not what it was for: with no record of the bolus, its end rolls
+    /// this far past each status.
+    /// ponytail: another controller's bolus is assumed to end within 30 s of each status; read its target from the
+    /// patch's history if a host needs the real end.
     static let foreignBolusEndsWithin: TimeInterval = 30
 
-    /// PumpDeliveryOdometer.bolusUnderWayEndsAt: when the bolus the patch reports ends, whoever started it
+    /// PumpDeliveryOdometer.bolusUnderWayEndsAt, as OmnipodKit's: each status that shows a bolus running sets when it
+    /// ends, from the units it has not delivered yet at the patch's bolus rate; one that shows none clears it
     static func trackBolusUnderWay(
         syncResponse: SynchronizePacketResponse,
         state: MedtrumPumpState,
@@ -203,8 +205,13 @@ enum StateSyncer {
             return
         }
 
-        let rolling = receivedAt.addingTimeInterval(foreignBolusEndsWithin)
-        state.reportedBolusEndsAt = state.bolusDose.map { max($0.estimatedEndDate, receivedAt) } ?? rolling
+        guard let dose = state.bolusDose else {
+            state.reportedBolusEndsAt = receivedAt.addingTimeInterval(foreignBolusEndsWithin)
+            return
+        }
+
+        let notDelivered = max(0, dose.value - bolus.delivered)
+        state.reportedBolusEndsAt = receivedAt.addingTimeInterval(notDelivered / MedtrumPumpManager.bolusUnitsPerSecond)
     }
 
     /// Another controller's delivery stops counting as possibly running once a full status shows the patch on its
