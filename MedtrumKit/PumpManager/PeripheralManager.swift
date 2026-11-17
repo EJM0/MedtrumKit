@@ -30,6 +30,16 @@ class PeripheralManager: NSObject {
 
     private let semaphore = DispatchSemaphore(value: 1)
 
+    /* access must be serialized with stateLock: writes queued or under way */
+    private var writesInFlight = 0
+
+    /// A write is queued or under way: the idle disconnect and a release wait for it
+    var isWriting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return writesInFlight > 0
+    }
+
     /* access must be serialized with stateLock, prevents concurrent `considerFullSync` runs */
     private var isFullSyncInFlight = false
 
@@ -84,9 +94,26 @@ class PeripheralManager: NSObject {
             return .failure(error: .noWriteCharacteristic)
         }
 
+        stateLock.lock()
+        writesInFlight += 1
+        stateLock.unlock()
+        defer {
+            stateLock.lock()
+            writesInFlight -= 1
+            stateLock.unlock()
+            bluetoothManager?.writeDidFinish()
+        }
+
         semaphore.wait()
         defer {
             semaphore.signal()
+        }
+
+        // A patch released to another controller is sent nothing, however the link came up: a full sync a
+        // notification started, or a write queued before the release. Before any IO, so the command certainly failed.
+        guard bluetoothManager?.isReleasedForLoan != true else {
+            log.warning("Control is released to another controller, not writing")
+            return .failure(error: .controlReleased)
         }
 
         let writeQ = MedtrumKitDispatchGroup()
@@ -335,6 +362,7 @@ extension PeripheralManager: CBPeripheralDelegate {
         }
 
         if characteristic.uuid == CBUUID.READ_UUID {
+            bluetoothManager?.noteActivity()
             handleHeartbeat(data: data)
 
             considerFullSync()

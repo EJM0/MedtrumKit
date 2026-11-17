@@ -45,6 +45,7 @@ enum StateSyncer {
         let hasActivatedPatch = syncResponse.state.rawValue >= PatchState.active.rawValue
 
         if let reservoir = syncResponse.reservoir {
+            state.reservoirReadAt = syncDate
             if hasActivatedPatch,
                let lowReservoirWarning = state.lowReservoirWarning,
                state.reservoir > lowReservoirWarning,
@@ -157,6 +158,9 @@ enum StateSyncer {
             }
         }
 
+        trackBolusUnderWay(syncResponse: syncResponse, state: state, fullSync: fullSync, receivedAt: syncDate)
+        settleForeignDelivery(syncResponse: syncResponse, state: state, fullSync: fullSync)
+
         if let bolusProgress = syncResponse.bolus {
             pumpManager.updateBolusProgress(
                 delivered: bolusProgress.delivered,
@@ -175,13 +179,64 @@ enum StateSyncer {
         pumpManager.notifyStateDidChange()
     }
 
-    private static func recordSuspendIfDelivering(
+    /// Rolling, because the patch does not report how much the bolus it is giving was for.
+    /// ponytail: another controller's bolus is assumed to end within 30 s of each status; read its target from
+    /// the patch's history if a host needs the real end.
+    static let foreignBolusEndsWithin: TimeInterval = 30
+
+    /// PumpDeliveryOdometer.bolusUnderWayEndsAt: when the bolus the patch reports ends, whoever started it
+    static func trackBolusUnderWay(
+        syncResponse: SynchronizePacketResponse,
+        state: MedtrumPumpState,
+        fullSync: Bool,
+        receivedAt: Date
+    ) {
+        guard let bolus = syncResponse.bolus else {
+            if fullSync {
+                state.reportedBolusEndsAt = nil
+            }
+            return
+        }
+
+        guard !bolus.completed else {
+            state.reportedBolusEndsAt = nil
+            return
+        }
+
+        let rolling = receivedAt.addingTimeInterval(foreignBolusEndsWithin)
+        state.reportedBolusEndsAt = state.bolusDose.map { max($0.estimatedEndDate, receivedAt) } ?? rolling
+    }
+
+    /// Another controller's delivery stops counting as possibly running once a full status shows the patch on its
+    /// schedule with no bolus
+    static func settleForeignDelivery(syncResponse: SynchronizePacketResponse, state: MedtrumPumpState, fullSync: Bool) {
+        guard state.untrackedDeliveryIsForeign, fullSync, !syncResponse.invalidPayload,
+              !syncResponse.state.isDeliveryHalted,
+              let basal = syncResponse.basal, !basal.type.isTempBasal(), !basal.type.isSuspendedByPump(),
+              syncResponse.bolus.map(\.completed) ?? true
+        else {
+            return
+        }
+
+        logger.info("Patch is on its schedule with no bolus: delivery it reports is this controller's again")
+        state.untrackedDeliveryIsForeign = false
+    }
+
+    static func recordSuspendIfDelivering(
         state: MedtrumPumpState,
         basal: BasalData?,
         receivedAt: Date
     ) -> [NewPumpEvent] {
         guard state.basalDose.type == .basal || state.basalDose.type == .resume || state.basalDose.type == .tempBasal
         else {
+            return []
+        }
+
+        if state.untrackedDeliveryIsForeign, state.basalDose.type != .tempBasal {
+            // The suspend may be another controller's, which booked it: follow it without booking it again. One that
+            // was this controller's goes unbooked too, counting basal that did not run - the side that gives less.
+            logger.info("Patch reports a suspend this controller did not command, not booking it")
+            state.basalDose = UnfinalizedDose(suspendStartTime: receivedAt)
             return []
         }
 
