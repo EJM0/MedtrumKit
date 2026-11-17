@@ -12,7 +12,7 @@ MedtrumKit connects to the patch the way OmnipodKit does. While the app is in th
 
 ## Handing the patch to another controller (Watch Loop)
 
-`MedtrumPumpManager` implements LoopKit's `DeviceConfigurationSharing`, `ExclusiveDeviceControl` and `PumpDeliveryOdometer`, as OmnipodKit does (loopandlearn/OmnipodKit#177). The export carries the pump base's serial number and session token and the doses in flight; each device keeps its own Bluetooth handle in `localState`, and a device without one finds the base by its serial number. The delivered total is what the patch has given since its first reservoir reading, in 0.05 U pulses. The `MedtrumKit-watchOS` target builds the kit without its UI for the watch.
+`MedtrumPumpManager` implements LoopKit's `DeviceConfigurationSharing`, `ExclusiveDeviceControl` and `PumpDeliveryOdometer`, as OmnipodKit does (loopandlearn/OmnipodKit#177). The export carries the pump base's serial number and session token and the doses in flight; each device keeps its own Bluetooth handle in `localState`, and a device without one finds the base by its serial number. The delivered total is what the patch has given since its first reservoir reading, in 0.05 U pulses. When a bolus under way ends comes from the patch, as OmnipodKit does: the units it has still to give at 1.5 U/min, with the amount from this controller's dose or, for another controller's bolus, from the patch's history record of it (`GET_RECORD`). The `MedtrumKit-watchOS` target builds the kit without its UI for the watch.
 
 ## For more information
 

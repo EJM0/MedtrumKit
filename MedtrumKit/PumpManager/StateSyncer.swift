@@ -158,7 +158,12 @@ enum StateSyncer {
             }
         }
 
-        trackBolusUnderWay(syncResponse: syncResponse, state: state, fullSync: fullSync, receivedAt: syncDate)
+        if let storage = syncResponse.storage {
+            state.latestRecordSequence = UInt64(storage.sequence)
+        }
+        if trackBolusUnderWay(syncResponse: syncResponse, state: state, fullSync: fullSync, receivedAt: syncDate) {
+            pumpManager.lookUpBolusRecord()
+        }
         settleForeignDelivery(syncResponse: syncResponse, state: state, fullSync: fullSync)
 
         if let bolusProgress = syncResponse.bolus {
@@ -179,39 +184,46 @@ enum StateSyncer {
         pumpManager.notifyStateDidChange()
     }
 
-    /// The patch reports what a bolus has delivered, not what it was for: with no record of the bolus, its end rolls
-    /// this far past each status.
-    /// ponytail: another controller's bolus is assumed to end within 30 s of each status; read its target from the
-    /// patch's history if a host needs the real end.
+    /// The status reports what a bolus has delivered, not what it was for. Without a record of the bolus - this
+    /// controller's dose, or the patch's history record of it - its end rolls this far past each status.
     static let foreignBolusEndsWithin: TimeInterval = 30
 
     /// PumpDeliveryOdometer.bolusUnderWayEndsAt, as OmnipodKit's: each status that shows a bolus running sets when it
-    /// ends, from the units it has not delivered yet at the patch's bolus rate; one that shows none clears it
+    /// ends, from the units it has not delivered yet at the patch's bolus rate; one that shows none clears it. The
+    /// amount comes from this controller's dose, or for another controller's bolus from the patch's history.
+    /// - Returns: the bolus has no amount yet: look up its history record (`MedtrumPumpManager.lookUpBolusRecord`)
+    @discardableResult
     static func trackBolusUnderWay(
         syncResponse: SynchronizePacketResponse,
         state: MedtrumPumpState,
         fullSync: Bool,
         receivedAt: Date
-    ) {
+    ) -> Bool {
         guard let bolus = syncResponse.bolus else {
             if fullSync {
-                state.reportedBolusEndsAt = nil
+                state.bolusEnded()
             }
-            return
+            return false
         }
 
         guard !bolus.completed else {
-            state.reportedBolusEndsAt = nil
-            return
+            state.bolusEnded()
+            return false
         }
 
-        guard let dose = state.bolusDose else {
-            state.reportedBolusEndsAt = receivedAt.addingTimeInterval(foreignBolusEndsWithin)
-            return
+        if let dose = state.bolusDose {
+            let record = BolusRecord(startedAt: dose.startDate, amount: dose.value, delivered: bolus.delivered)
+            state.reportedBolusEndsAt = record.endsAt(delivered: bolus.delivered, at: receivedAt)
+            return false
         }
 
-        let notDelivered = max(0, dose.value - bolus.delivered)
-        state.reportedBolusEndsAt = receivedAt.addingTimeInterval(notDelivered / MedtrumPumpManager.bolusUnitsPerSecond)
+        if let record = state.bolusRecord {
+            state.reportedBolusEndsAt = record.endsAt(delivered: bolus.delivered, at: receivedAt)
+            return false
+        }
+
+        state.reportedBolusEndsAt = receivedAt.addingTimeInterval(foreignBolusEndsWithin)
+        return true
     }
 
     /// Another controller's delivery stops counting as possibly running once a full status shows the patch on its

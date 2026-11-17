@@ -114,7 +114,7 @@ extension MedtrumPumpState {
     /// Another controller ran the patch: book none of its delivery, and with `dropInFlight` drop the in-flight copies,
     /// which that controller booked
     func resolveAfterForeignControl(dropInFlight: Bool, at now: Date = .now) {
-        reportedBolusEndsAt = nil
+        bolusEnded()
         untrackedDeliveryIsForeign = true
         controlReleased = false
         inFlightDosesInheritedAway = false
@@ -270,6 +270,52 @@ extension MedtrumPumpManager: PumpDeliveryOdometer {
         }
 
         return endsAt
+    }
+
+    /// A bolus is running that this controller has no dose for: read the patch's newest history record, and if it is
+    /// that bolus, time its end from the amount it records. Once per record; until then the end rolls 30 s ahead.
+    func lookUpBolusRecord() {
+        guard let sequence = state.latestRecordSequence, state.bolusRecordLookedUp != sequence else {
+            return
+        }
+
+        state.bolusRecordLookedUp = sequence
+        let patchId = state.patchId.toUInt64()
+
+        // Off the queue the status arrived on: the response is delivered there
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.bluetooth.write(GetRecordPacket(recordIndex: sequence, patchId: patchId))
+            guard case let .success(data) = result, let response = data as? GetRecordPacketResponse else {
+                if case let .failure(error) = result {
+                    handoffLog.warning("Bolus record #\(sequence) could not be read: \(error.errorDescription)")
+                }
+                return
+            }
+
+            let now = Date.now
+            guard let record = response.bolus, record.canBeRunning(at: now) else {
+                // Shows whether the patch writes the record at the start of a bolus, or only at its end
+                self.logDeviceCommunication(
+                    "bolus record #\(sequence): type \(response.recordType), valid \(response.isValid), " +
+                        "\(response.bolus.map { "\($0.amount) U from \($0.startedAt), \($0.delivered) U delivered" } ?? "no bolus")" +
+                        " - not the bolus running, its end stays rolling",
+                    type: .receive
+                )
+                return
+            }
+
+            self.logDeviceCommunication(
+                "bolus record #\(sequence): \(record.amount) U from \(record.startedAt), \(record.delivered) U delivered - " +
+                    "timing the bolus running from it",
+                type: .receive
+            )
+            guard self.state.bolusDose == nil, self.state.reportedBolusEndsAt != nil else {
+                return
+            }
+
+            self.state.bolusRecord = record
+            self.state.reportedBolusEndsAt = max(now, record.endsAt(delivered: record.delivered, at: now))
+        }
     }
 
     /// A real status read, bypassing the freshness shortcut in ensureCurrentPumpData

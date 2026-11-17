@@ -208,8 +208,15 @@ final class DeviceHandoffTests: XCTestCase {
         var response = SynchronizePacketResponse(state: .active, activeAlarms: [])
 
         response.bolus = BolusData(type: 0, completed: false, delivered: 0.5)
-        StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)
+        let needsRecord = StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)
+        XCTAssertTrue(needsRecord, "another controller's bolus: its amount is in the patch's history")
         XCTAssertEqual(state.reportedBolusEndsAt, now.addingTimeInterval(StateSyncer.foreignBolusEndsWithin))
+
+        // Its history record says 2 U: the other 1.5 U at 1.5 U/min take 60 s
+        state.bolusRecord = BolusRecord(startedAt: now.addingTimeInterval(-20), amount: 2, delivered: 0)
+        XCTAssertFalse(StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now))
+        XCTAssertEqual(state.reportedBolusEndsAt!.timeIntervalSince(now), 60, accuracy: 1e-9)
+        state.bolusRecord = nil
 
         // Our own 1 U bolus, 0.5 U delivered: the other 0.5 U at 1.5 U/min take 20 s
         state.bolusDose = makeBolus()
@@ -225,8 +232,58 @@ final class DeviceHandoffTests: XCTestCase {
         XCTAssertNotNil(state.reportedBolusEndsAt, "a notification without bolus data says nothing about it")
 
         response.bolus = BolusData(type: 0, completed: true, delivered: 1)
+        state.bolusRecord = BolusRecord(startedAt: now, amount: 1, delivered: 0)
+        state.bolusRecordLookedUp = 7
         StateSyncer.trackBolusUnderWay(syncResponse: response, state: state, fullSync: false, receivedAt: now)
         XCTAssertNil(state.reportedBolusEndsAt)
+        XCTAssertNil(state.bolusRecord)
+        XCTAssertNil(state.bolusRecordLookedUp)
+    }
+
+    // MARK: Bolus history record
+
+    func testGetRecordRequestCarriesIndexAndPatchId() {
+        let packet = GetRecordPacket(recordIndex: 0x0102, patchId: 0x0A0B0C)
+        XCTAssertEqual(packet.getRequestBytes(), Data([0x02, 0x01, 0x0C, 0x0B]))
+    }
+
+    func testGetRecordParsesANormalBolus() {
+        let startedAt = Date.fromMedtrumSeconds(400_000_000)
+        var data = Data(count: 46)
+        data[6] = GetRecordPacket.validHeader
+        data[8] = 1 // bolus record
+        data.replaceSubrange(16 ..< 18, with: UInt64(321).toData(length: 2))
+        data[18] = 0x11 // normal, from the wizard
+        data.replaceSubrange(22 ..< 26, with: UInt64(400_000_000).toData(length: 4))
+        data.replaceSubrange(26 ..< 28, with: UInt64(50).toData(length: 2)) // 2.5 U
+        data.replaceSubrange(28 ..< 30, with: UInt64(10).toData(length: 2)) // 0.5 U
+        let packet = GetRecordPacket(recordIndex: 321, patchId: 1)
+        packet.totalData = data
+
+        let response = packet.parseResponse()
+        XCTAssertTrue(response.isValid)
+        XCTAssertEqual(response.sequence, 321)
+        XCTAssertEqual(response.bolus?.startedAt, startedAt)
+        XCTAssertEqual(response.bolus?.amount ?? -1, 2.5, accuracy: 1e-9)
+        XCTAssertEqual(response.bolus?.delivered ?? -1, 0.5, accuracy: 1e-9)
+
+        data[8] = 2 // basal record
+        packet.totalData = data
+        XCTAssertNil(packet.parseResponse().bolus)
+    }
+
+    func testOnlyARecordOfABolusStillRunningIsUsed() {
+        let now = Date()
+        // 3 U take 120 s
+        XCTAssertTrue(BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 0).canBeRunning(at: now))
+        XCTAssertFalse(
+            BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 3).canBeRunning(at: now),
+            "written once it was all delivered"
+        )
+        XCTAssertFalse(
+            BolusRecord(startedAt: now.addingTimeInterval(-600), amount: 3, delivered: 1).canBeRunning(at: now),
+            "an older bolus, long over"
+        )
     }
 
     // MARK: Connect clock

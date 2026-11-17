@@ -324,6 +324,19 @@ public class MedtrumPumpState: RawRepresentable {
     public var cancelingBolusSince: Date?
     /// When the bolus the patch reported at its last status ends, whoever started it (PumpDeliveryOdometer)
     public var reportedBolusEndsAt: Date?
+    /// The patch's newest history record, from its status
+    var latestRecordSequence: UInt64?
+    /// The history record of a bolus running that this controller has no dose for, once looked up
+    var bolusRecord: BolusRecord?
+    /// The history record last looked up for it, so each record is read once
+    var bolusRecordLookedUp: UInt64?
+
+    /// The patch shows no bolus running
+    func bolusEnded() {
+        reportedBolusEndsAt = nil
+        bolusRecord = nil
+        bolusRecordLookedUp = nil
+    }
     // **** END ****
 
     public var bolusDose: UnfinalizedDose?
