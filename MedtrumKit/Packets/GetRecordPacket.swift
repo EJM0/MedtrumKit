@@ -10,10 +10,15 @@ struct BolusRecord: Equatable {
     }
 
     /// It can still be running at `date`: not all delivered when recorded, started, and not past the end its amount
-    /// allows (a minute's slack either way for the two clocks). A record written only once its bolus ended fails this.
-    func canBeRunning(at date: Date) -> Bool {
-        delivered < amount && startedAt <= date.addingTimeInterval(60) &&
-            endsAt(delivered: 0, at: startedAt).addingTimeInterval(60) >= date
+    /// allows, with `slack` either way for the two clocks. A record written only once its bolus ended fails this.
+    func canBeRunning(at date: Date, slack: TimeInterval) -> Bool {
+        delivered < amount && startedAt <= date.addingTimeInterval(slack) &&
+            endsAt(delivered: 0, at: startedAt).addingTimeInterval(slack) >= date
+    }
+
+    /// The record with its start in this device's time (`MedtrumPumpState.deviceTime`)
+    func inDeviceTime(of state: MedtrumPumpState) -> BolusRecord {
+        BolusRecord(startedAt: state.deviceTime(startedAt), amount: amount, delivered: delivered)
     }
 }
 

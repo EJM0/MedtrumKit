@@ -11,8 +11,10 @@
 //  without booking.
 //
 //  Medtrum needs less than Omnipod: the session token authorizes any controller and the write sequence starts over on
-//  every connection, so the export carries the token and there is no counter to resynchronize. It also cannot tell
-//  that another controller used the patch, so a controller stands aside only when its host releases it.
+//  every connection, so the export carries the token and there is no counter to resynchronize. Without such a counter,
+//  another controller's use shows in the delivery the patch reports: a temp basal or a bolus that began while this
+//  controller was not connected (`otherControllerEvidence`). A controller that finds one stands aside until its host
+//  takes control again, as OmnipodKit's does at an unexpected session resync.
 //
 
 import Foundation
@@ -23,8 +25,14 @@ private let handoffLog = MedtrumLogger(category: "DeviceHandoff")
 // MARK: - Configuration sharing
 
 extension MedtrumPumpManager: DeviceConfigurationSharing {
+    /// Marks the patch shared: another controller may run it from this copy
     public func exportConfiguration() -> SharedDeviceConfiguration {
-        SharedDeviceConfiguration(
+        if !state.isShared, !state.patchId.isEmpty {
+            state.sharedPatchId = state.patchId
+            notifyStateDidChange()
+        }
+
+        return SharedDeviceConfiguration(
             managerIdentifier: pluginIdentifier,
             asOf: state.reservoirReadAt ?? state.lastSync,
             deliveredUnits: deliveredUnits?.units,
@@ -77,6 +85,8 @@ extension MedtrumPumpState {
         shared.configuredByAnotherController = false
         shared.inFlightDosesInheritedAway = false
         shared.untrackedDeliveryIsForeign = false
+        shared.expectsForeignRecords = false
+        shared.otherControllerDetectedAt = nil
         return shared
     }
 
@@ -89,6 +99,8 @@ extension MedtrumPumpState {
         state.configuredByAnotherController = true
         state.inFlightDosesInheritedAway = false
         state.untrackedDeliveryIsForeign = true
+        state.sharedPatchId = patchId
+        state.expectsForeignRecords = true
         return state
     }
 
@@ -161,9 +173,15 @@ extension MedtrumPumpManager: ExclusiveDeviceControl {
         if state.controlReleased {
             bluetooth.connectClock.beginAttempt(adoptedHandle: nil)
             state.resolveAfterForeignControl(dropInFlight: state.inFlightDosesInheritedAway)
-            notifyStateDidChange()
             handoffLog.info("Control taken back, delivery the patch reports is another controller's until it settles")
         }
+        if state.otherControllerDetectedAt != nil {
+            logDeviceCommunication("[trust] taking control again after another controller was detected", type: .connection)
+            state.otherControllerDetectedAt = nil
+        }
+        // The first connection after a take meets the other controller's delivery before it
+        state.expectsForeignRecords = state.isShared
+        notifyStateDidChange()
 
         bluetooth.take(search: takeControlNeedsSearch)
         bluetooth.scheduleTakeEscalation(after: Self.takeEscalateAfter)
@@ -196,6 +214,86 @@ extension MedtrumPumpManager: ExclusiveDeviceControl {
         }
 
         return MedtrumPumpState.handle(in: localState, forPumpSN: shared.pumpSN) == nil
+    }
+}
+
+// MARK: - Detecting another controller
+
+extension MedtrumPumpState {
+    /// Newest history records a connection reads, newest first
+    static let otherControllerRecordsRead: UInt64 = 8
+
+    /// This patch was handed over (exported or adopted): another controller may run it
+    var isShared: Bool {
+        !patchId.isEmpty && sharedPatchId == patchId
+    }
+
+    /// At a connection's first status: delivery the patch never starts by itself - a temp basal, a bolus - that began
+    /// after this controller last heard the patch (`since`), when only another controller can have been connected. This
+    /// controller's own commands are answered, which moves `since` past them. Alarms, suspends, a temp basal running
+    /// out and daily totals the patch writes by itself prove nothing. The one connection a take or an adopt expects is
+    /// skipped: the other controller's use before it. Patch times are compared in this device's time
+    /// (`deviceTime`), within `patchClockSlack`.
+    /// ponytail: a bolus whose record the patch writes only at its end, and that is still running here, goes unseen;
+    /// the other controller's next temp basal or bolus shows it. Read the running bolus' record if that is too late.
+    /// - Parameters:
+    ///   - previousSequence: the newest history record this controller saw before this connection
+    ///   - basal: what the patch runs, from this connection's first status
+    ///   - readRecord: reads one history record over this connection
+    /// - Returns: what shows another controller ran the patch, for the log
+    func otherControllerEvidence(
+        since: Date?,
+        previousSequence: UInt64?,
+        basal: BasalData?,
+        readRecord: (UInt64) -> GetRecordPacketResponse?
+    ) -> String? {
+        let expected = expectsForeignRecords
+        expectsForeignRecords = false
+        guard isShared, !expected, let since else {
+            return nil
+        }
+
+        let after = since.addingTimeInterval(patchClockSlack)
+        if let basal, basal.type.isTempBasal(), deviceTime(basal.startTime) > after {
+            return "a temp basal of \(basal.rate) U/h started \(deviceTime(basal.startTime)), " +
+                "after this controller's last contact \(since)"
+        }
+
+        guard let previous = previousSequence, let latest = latestRecordSequence, latest > previous else {
+            return nil
+        }
+
+        let oldest = max(previous + 1, latest - min(latest, Self.otherControllerRecordsRead - 1))
+        for index in stride(from: latest, through: oldest, by: -1) {
+            if let bolus = readRecord(index)?.bolus?.inDeviceTime(of: self), bolus.startedAt > after {
+                return "a bolus of \(bolus.amount) U started \(bolus.startedAt) (record #\(index)), " +
+                    "after this controller's last contact \(since)"
+            }
+        }
+        return nil
+    }
+}
+
+public extension MedtrumPumpManager {
+    /// When another controller was found to have run the patch, as OmnipodKit's: nothing is sent until the host takes
+    /// control again
+    var otherControllerDetectedAt: Date? {
+        state.otherControllerDetectedAt
+    }
+}
+
+extension MedtrumPumpManager {
+    /// Another controller ran the patch since this one last did: book none of its delivery, keep this controller's
+    /// doses in flight (the other did not adopt them), and send nothing more until the host takes control again
+    func standAside(because evidence: String) {
+        state.resolveAfterForeignControl(dropInFlight: false)
+        state.otherControllerDetectedAt = .now
+        bluetooth.releaseForLoan()
+        logDeviceCommunication(
+            "[trust] another controller has used the patch: \(evidence) - sending nothing until control is taken again",
+            type: .connection
+        )
+        notifyStateDidChange()
     }
 }
 
@@ -236,11 +334,12 @@ public extension MedtrumPumpManager {
     /// The controller that ended the patch booked its last delivery: this copy's in-flight doses are dropped as at a
     /// take-back, and the session ends without booking anything
     func forgetDeviceDeactivatedElsewhere() async {
-        guard !state.patchSessionEnded, state.controlReleased else {
+        guard !state.patchSessionEnded, state.controlReleased || state.otherControllerDetectedAt != nil else {
             return
         }
 
         state.resolveAfterForeignControl(dropInFlight: state.inFlightDosesInheritedAway)
+        state.otherControllerDetectedAt = nil
         logDeviceCommunication("[release] the patch was deactivated by another controller; forgotten here", type: .connection)
         endPatchSession(at: .now, statusIsCurrent: false, bookingDelivery: false)
         // As a deactivation here: the base's handle goes too, the next patch is set up in the foreground
@@ -293,7 +392,9 @@ extension MedtrumPumpManager: PumpDeliveryOdometer {
             }
 
             let now = Date.now
-            guard let record = response.bolus, record.canBeRunning(at: now) else {
+            guard let record = response.bolus?.inDeviceTime(of: self.state),
+                  record.canBeRunning(at: now, slack: self.state.patchClockSlack)
+            else {
                 // Shows whether the patch writes the record at the start of a bolus, or only at its end
                 self.logDeviceCommunication(
                     "bolus record #\(sequence): type \(response.recordType), valid \(response.isValid), " +

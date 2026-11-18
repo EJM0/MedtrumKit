@@ -99,12 +99,23 @@ final class DeviceHandoffTests: XCTestCase {
         state.inFlightDosesInheritedAway = true
         state.untrackedDeliveryIsForeign = true
         state.configuredByAnotherController = true
+        state.sharedPatchId = state.patchId
+        state.expectsForeignRecords = true
+        let now = Date()
+        state.otherControllerDetectedAt = now
+        state.lastContactAt = now
+        state.latestRecordSequence = 42
 
         let restored = MedtrumPumpState(rawValue: state.rawValue)
         XCTAssertTrue(restored.controlReleased)
         XCTAssertTrue(restored.inFlightDosesInheritedAway)
         XCTAssertTrue(restored.untrackedDeliveryIsForeign)
         XCTAssertTrue(restored.configuredByAnotherController)
+        XCTAssertTrue(restored.isShared)
+        XCTAssertTrue(restored.expectsForeignRecords)
+        XCTAssertEqual(restored.otherControllerDetectedAt, now)
+        XCTAssertEqual(restored.lastContactAt, now)
+        XCTAssertEqual(restored.latestRecordSequence, 42)
     }
 
     // MARK: Release and take back
@@ -275,15 +286,165 @@ final class DeviceHandoffTests: XCTestCase {
     func testOnlyARecordOfABolusStillRunningIsUsed() {
         let now = Date()
         // 3 U take 120 s
-        XCTAssertTrue(BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 0).canBeRunning(at: now))
+        XCTAssertTrue(BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 0).canBeRunning(at: now, slack: 5))
         XCTAssertFalse(
-            BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 3).canBeRunning(at: now),
+            BolusRecord(startedAt: now.addingTimeInterval(-30), amount: 3, delivered: 3).canBeRunning(at: now, slack: 5),
             "written once it was all delivered"
         )
         XCTAssertFalse(
-            BolusRecord(startedAt: now.addingTimeInterval(-600), amount: 3, delivered: 1).canBeRunning(at: now),
+            BolusRecord(startedAt: now.addingTimeInterval(-600), amount: 3, delivered: 1).canBeRunning(at: now, slack: 5),
             "an older bolus, long over"
         )
+        XCTAssertFalse(
+            BolusRecord(startedAt: now.addingTimeInterval(10), amount: 3, delivered: 0).canBeRunning(at: now, slack: 5),
+            "not started yet, past the slack"
+        )
+    }
+
+    func testPatchTimesAreConvertedWithTheMeasuredOffset() {
+        let state = makeState()
+        let now = Date()
+        state.pumpTimeSyncedAt = now
+        state.pumpTime = now.addingTimeInterval(120) // the patch runs 2 min ahead
+        XCTAssertEqual(state.deviceTime(now.addingTimeInterval(120)), now)
+        XCTAssertEqual(state.patchClockSlack, 5)
+
+        state.pumpTimeSyncedAt = now.addingTimeInterval(-.hours(2))
+        XCTAssertEqual(state.patchClockSlack, 60, "an old measurement")
+    }
+
+    // MARK: Another controller
+
+    private func makeShared() -> MedtrumPumpState {
+        let state = makeState()
+        state.sharedPatchId = state.patchId
+        return state
+    }
+
+    private func tempBasal(startedAt: Date) -> BasalData {
+        BasalData(type: .ABSOLUTE_TEMP, sequence: 0, patchId: 256, startTime: startedAt, rate: 2, delivery: 0)
+    }
+
+    private func bolusRecord(startedAt: Date) -> GetRecordPacketResponse {
+        GetRecordPacketResponse(
+            isValid: true,
+            recordType: 1,
+            sequence: 0,
+            bolus: BolusRecord(startedAt: startedAt, amount: 1, delivered: 1)
+        )
+    }
+
+    private let alarmRecord = GetRecordPacketResponse(isValid: true, recordType: 3, sequence: 0, bolus: nil)
+
+    func testATempBasalStartedAfterTheLastContactIsAnotherControllers() {
+        let state = makeShared()
+        let since = Date()
+
+        XCTAssertNotNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: tempBasal(startedAt: since + 120)) { _ in nil }
+        )
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: tempBasal(startedAt: since + 3)) { _ in nil },
+            "this controller's own, within the clocks' slack"
+        )
+        XCTAssertNotNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: tempBasal(startedAt: since + 10)) { _ in nil }
+        )
+
+        // A patch 2 min ahead: its 1:40 past the last contact is 20 s before it here
+        state.pumpTimeSyncedAt = Date()
+        state.pumpTime = state.pumpTimeSyncedAt.addingTimeInterval(120)
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: tempBasal(startedAt: since + 100)) { _ in nil },
+            "this controller's own, in the patch's time"
+        )
+        let scheduled = BasalData(type: .STANDARD, sequence: 0, patchId: 256, startTime: since + 600, rate: 1, delivery: 0)
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: scheduled) { _ in nil },
+            "the patch changes its scheduled basal by itself"
+        )
+    }
+
+    func testOnlyABolusStartedAfterTheLastContactIsAnotherControllers() {
+        let state = makeShared()
+        let since = Date()
+        state.latestRecordSequence = 12
+
+        var read: [UInt64] = []
+        let own = state.otherControllerEvidence(since: since, previousSequence: 10, basal: nil) { index in
+            read.append(index)
+            return self.bolusRecord(startedAt: since - 60)
+        }
+        XCTAssertNil(own, "this controller's bolus, before its last contact")
+        XCTAssertEqual(read, [12, 11], "the records new since the last contact, newest first")
+
+        let foreign = state.otherControllerEvidence(since: since, previousSequence: 10, basal: nil) { index in
+            index == 11 ? self.bolusRecord(startedAt: since + 300) : self.alarmRecord
+        }
+        XCTAssertNotNil(foreign)
+
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: 10, basal: nil) { _ in self.alarmRecord },
+            "records the patch writes by itself"
+        )
+    }
+
+    func testAtMostTheNewestRecordsAreRead() {
+        let state = makeShared()
+        state.latestRecordSequence = 100
+        var read: [UInt64] = []
+        _ = state.otherControllerEvidence(since: Date(), previousSequence: 10, basal: nil) { index in
+            read.append(index)
+            return nil
+        }
+        XCTAssertEqual(read, Array((93 ... 100).reversed()))
+
+        read = []
+        state.latestRecordSequence = 5
+        _ = state.otherControllerEvidence(since: Date(), previousSequence: 10, basal: nil) { index in
+            read.append(index)
+            return nil
+        }
+        XCTAssertEqual(read, [], "a history that went back is another patch's")
+    }
+
+    func testOnlyAPatchHandedOverIsChecked() {
+        let state = makeState()
+        let since = Date()
+        let foreign = tempBasal(startedAt: since + 600)
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: foreign) { _ in nil },
+            "never exported or adopted"
+        )
+
+        state.sharedPatchId = state.patchId
+        state.expectsForeignRecords = true
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: foreign) { _ in nil },
+            "the connection after a take or an adopt meets the other controller's delivery before it"
+        )
+        XCTAssertFalse(state.expectsForeignRecords)
+        XCTAssertNotNil(state.otherControllerEvidence(since: since, previousSequence: nil, basal: foreign) { _ in nil })
+
+        state.patchId = UInt64(257).toData(length: 4)
+        XCTAssertNil(
+            state.otherControllerEvidence(since: since, previousSequence: nil, basal: foreign) { _ in nil },
+            "a new patch is not the one handed over"
+        )
+    }
+
+    func testAnAdoptExpectsTheOtherControllersDeliveryAndTheExportCarriesNoDetection() {
+        let exporter = makeShared()
+        exporter.otherControllerDetectedAt = Date()
+        exporter.expectsForeignRecords = true
+
+        let shared = exporter.sharedCopy()
+        XCTAssertNil(shared.otherControllerDetectedAt)
+        XCTAssertFalse(shared.expectsForeignRecords)
+
+        let adopted = MedtrumPumpManager.adoptedState(from: export(makeState()), localState: nil)
+        XCTAssertEqual(adopted?.isShared, true)
+        XCTAssertEqual(adopted?.expectsForeignRecords, true)
     }
 
     // MARK: Connect clock

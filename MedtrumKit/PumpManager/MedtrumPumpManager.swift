@@ -49,7 +49,7 @@ public class MedtrumPumpManager: DeviceManager {
         oldState = MedtrumPumpState(rawValue: state.rawValue)
         bluetooth = BluetoothManager(
             knownPeripheralIdentifier: state.peripheralIdentifier,
-            controlReleased: state.controlReleased
+            controlReleased: state.controlReleased || state.otherControllerDetectedAt != nil
         )
         refreshLogDeviceIdentifier()
 
@@ -1319,9 +1319,10 @@ public extension MedtrumPumpManager {
     }
 
     private func ensureConnectedAndActive(_ completion: @escaping (MedtrumConnectError?) -> Void) {
-        // A controller that has released the patch commands nothing until it takes control again
-        guard !state.controlReleased else {
-            log.warning("Control of the patch is released, failing immediately")
+        // A controller that has released the patch, or found another controller running it, commands nothing until it
+        // takes control again
+        guard !state.controlReleased, state.otherControllerDetectedAt == nil else {
+            log.warning("Control of the patch is released or another controller has used it, failing immediately")
             completion(.controlReleased)
             return
         }

@@ -43,6 +43,12 @@ class PeripheralManager: NSObject {
     /* access must be serialized with stateLock, prevents concurrent `considerFullSync` runs */
     private var isFullSyncInFlight = false
 
+    /// What this controller knew before this connection, and what the connection's first status shows: whether another
+    /// controller ran the patch in between (`MedtrumPumpState.otherControllerEvidence`). Connect flow only.
+    private let contactBeforeConnect: Date?
+    private let sequenceBeforeConnect: UInt64?
+    private var basalAtConnect: BasalData?
+
     public init(
         _ peripheral: CBPeripheral,
         _ bluetoothManager: BluetoothManager,
@@ -53,6 +59,8 @@ class PeripheralManager: NSObject {
         self.bluetoothManager = bluetoothManager
         self.pumpManager = pumpManager
         self.completion = completion
+        contactBeforeConnect = pumpManager.state.lastContactAt
+        sequenceBeforeConnect = pumpManager.state.latestRecordSequence
 
         super.init()
 
@@ -222,6 +230,7 @@ extension PeripheralManager {
             }
 
             parseStateUpdate(syncResponse, duringReconnect: true, fullSync: true)
+            basalAtConnect = syncResponse.invalidPayload ? nil : syncResponse.basal
             subscribe()
         }
     }
@@ -241,6 +250,13 @@ extension PeripheralManager {
                 return
             }
 
+            // Before any command of this controller's goes out
+            if let pumpManager, let evidence = otherControllerEvidence(pumpManager) {
+                pumpManager.standAside(because: evidence)
+                completion?(.controlReleased)
+                return
+            }
+
             log.info("Connected to pump!")
 
             stateLock.lock()
@@ -250,6 +266,40 @@ extension PeripheralManager {
             pumpManager?.state.isConnected = true
             pumpManager?.notifyStateDidChange()
             completion?(nil)
+        }
+    }
+
+    /// See MedtrumPumpState.otherControllerEvidence. The history's movement is logged at every connection, shared patch
+    /// or not, and each record read with its type: which records the patch writes by itself shows there.
+    private func otherControllerEvidence(_ pumpManager: MedtrumPumpManager) -> String? {
+        let state = pumpManager.state
+        if let latest = state.latestRecordSequence, latest != sequenceBeforeConnect {
+            pumpManager.logDeviceCommunication(
+                "history #\(sequenceBeforeConnect.map(String.init) ?? "-") -> #\(latest) since this controller's last contact " +
+                    "\(contactBeforeConnect.map { "\($0)" } ?? "-")\(state.isShared ? "" : " (patch not shared)")",
+                type: .receive
+            )
+        }
+
+        let patchId = state.patchId.toUInt64()
+        return state.otherControllerEvidence(
+            since: contactBeforeConnect,
+            previousSequence: sequenceBeforeConnect,
+            basal: basalAtConnect
+        ) { index in
+            guard case let .success(data) = writePacket(GetRecordPacket(recordIndex: index, patchId: patchId)),
+                  let record = data as? GetRecordPacketResponse
+            else {
+                pumpManager.logDeviceCommunication("history #\(index) could not be read", type: .receive)
+                return nil
+            }
+
+            pumpManager.logDeviceCommunication(
+                "history #\(index): type \(record.recordType), valid \(record.isValid)" +
+                    (record.bolus.map { ", bolus \($0.amount) U from \($0.startedAt)" } ?? ""),
+                type: .receive
+            )
+            return record
         }
     }
 
@@ -360,6 +410,9 @@ extension PeripheralManager: CBPeripheralDelegate {
             )
             return
         }
+
+        // Any answer or notification: the patch's records of this controller's commands start before it
+        pumpManager?.state.lastContactAt = .now
 
         if characteristic.uuid == CBUUID.READ_UUID {
             bluetoothManager?.noteActivity()
